@@ -1,47 +1,53 @@
 "use client"
 
+import { useState } from "react"
 import { Clock } from "./clock"
 import { CalendarWidget } from "./calendar-widget"
 import { WeatherWidget } from "./weather-widget"
-import { 
-  TimerActivity, 
-  MusicActivity, 
-  DeliveryActivity 
-} from "./live-activity"
+import { TimerActivity, MusicActivity, DeliveryActivity } from "./live-activity"
+import { Dock } from "./dock"
+
+type Page = "home" | "calendar" | "weather" | "activities"
 
 export function SmartDisplay() {
+  const [activePage, setActivePage] = useState<Page>("home")
+
   return (
-    <div className="min-h-screen bg-background p-8 flex flex-col">
-      {/* Main clock - center focus */}
-      <div className="flex-1 flex items-center justify-center">
-        <Clock />
-      </div>
+    <div className="min-h-screen bg-background flex flex-col overflow-hidden">
+      {/* Page content */}
+      <main className="flex-1 flex items-center justify-center pb-28">
+        {activePage === "home" && (
+          <div className="flex flex-col items-center justify-center">
+            <Clock />
+          </div>
+        )}
 
-      {/* Bottom widgets grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-auto">
-        {/* Weather */}
-        <WeatherWidget />
+        {activePage === "calendar" && (
+          <div className="w-full max-w-md px-6">
+            <CalendarWidget />
+          </div>
+        )}
 
-        {/* Calendar */}
-        <CalendarWidget />
+        {activePage === "weather" && (
+          <div className="w-full max-w-sm px-6">
+            <WeatherWidget />
+          </div>
+        )}
 
-        {/* Live Activities */}
-        <div className="space-y-4">
-          <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider px-1">
-            Live Activities
-          </h3>
-          <TimerActivity initialSeconds={1500} label="Focus Session" />
-          <MusicActivity />
-        </div>
+        {activePage === "activities" && (
+          <div className="w-full max-w-md px-6 space-y-3">
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-widest text-center mb-6">
+              Live Activities
+            </p>
+            <TimerActivity initialSeconds={1500} label="Focus Session" />
+            <MusicActivity />
+            <DeliveryActivity />
+          </div>
+        )}
+      </main>
 
-        {/* More Live Activities */}
-        <div className="space-y-4">
-          <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider px-1">
-            Updates
-          </h3>
-          <DeliveryActivity />
-        </div>
-      </div>
+      {/* macOS-style Dock */}
+      <Dock activePage={activePage} onNavigate={setActivePage} />
     </div>
   )
 }
