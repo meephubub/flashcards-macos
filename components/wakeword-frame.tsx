@@ -3,8 +3,8 @@
 import * as React from "react"
 
 import { SiriGlowClock } from "./siri-glow-clock"
-import { KeywordDetector } from "web-wake-word"
-import { MicVAD } from "@ricky0123/vad-web"
+// @ts-ignore - No types available for this package
+import WakeWordEngine from "openwakeword-wasm-browser"
 
 export function WakewordFrame() {
   const [active, setActive] = React.useState(false)
@@ -13,9 +13,16 @@ export function WakewordFrame() {
   const [micStatus, setMicStatus] = React.useState<"idle" | "requesting" | "active" | "denied">(
     "idle",
   )
+  const [detected, setDetected] = React.useState<string | null>(null)
 
-  const vadRef = React.useRef<MicVAD | null>(null)
+  const vadRef = React.useRef<any | null>(null)
   const stopTimerRef = React.useRef<number | null>(null)
+  const engine = React.useMemo(() => new WakeWordEngine({
+    baseAssetUrl: '/openwakeword/models',
+    keywords: ['alexa'],
+    detectionThreshold: 0.5,
+    cooldownMs: 2000
+  }), [])
 
   const clearStopTimer = React.useCallback(() => {
     if (stopTimerRef.current) {
@@ -60,8 +67,16 @@ export function WakewordFrame() {
     }
 
     try {
+      const { MicVAD } = await import("@ricky0123/vad-web")
+      console.log("Initializing VAD with public directories")
+      
+      // Configure ONNX Runtime to use public directory
+      const ort = await import("onnxruntime-web")
+      ort.env.wasm.wasmPaths = "/onnx/"
+      
       const vad = await MicVAD.new({
-        baseAssetPath: "/api/vad/",
+        baseAssetPath: "/vad/",
+        onnxWASMBasePath: "/onnx/",
         onSpeechStart: () => {
           clearStopTimer()
         },
@@ -75,9 +90,9 @@ export function WakewordFrame() {
           let sum = 0
           for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i]
           const rms = Math.sqrt(sum / frame.length)
-          // Smooth + clamp into a UI-friendly 0..1 range.
+          // Smooth + clamp into a UI-friendly 0..1 range with reduced sensitivity
           setActivity((prev) => {
-            const next = Math.max(prev * 0.82, Math.min(1, rms * 4.5))
+            const next = Math.max(prev * 0.9, Math.min(1, rms * 2.0))
             return next
           })
         },
@@ -85,7 +100,8 @@ export function WakewordFrame() {
       vadRef.current = vad
       await vad.start()
       setMicStatus("active")
-    } catch {
+    } catch (error) {
+      console.error("VAD initialization failed:", error)
       setMicStatus("denied")
     }
   }, [clearStopTimer, deactivate])
@@ -97,32 +113,30 @@ export function WakewordFrame() {
   }, [deactivate])
 
   React.useEffect(() => {
-    let detector: KeywordDetector | null = null
-    let cancelled = false
+    const unsubs: (() => void)[] = []
 
-    async function start() {
+    const start = async () => {
       try {
-        // IMPORTANT: web-wake-word requires ONNX models. Put these in:
-        // public/wakewords/{embedding_model.onnx,melspectrogram.onnx,hey.onnx}
-        detector = new KeywordDetector(
-          "/wakewords",
-          [
-            {
-              modelToUse: "hey.onnx",
-              threshold: 0.7,
-              bufferCount: 3,
-              onKeywordDetected: () => void activate(),
-            },
-          ],
-          "/api/web-wake-word/",
-          "/api/web-wake-word/",
-        )
-        await detector.init()
-        if (cancelled) return
+        console.log('Loading wake word engine...')
+        await engine.load()
+        console.log('Wake word engine loaded successfully')
+        unsubs.push(engine.on('detect', ({ keyword, score }: { keyword: string; score: number }) => {
+          console.log(`Wake word detected: ${keyword} (${score})`)
+          setDetected(`${keyword} (${score.toFixed(2)})`)
+          void activate()
+        }))
+        unsubs.push(engine.on('error', (err: any) => {
+          console.error('Wake word engine error:', err)
+        }))
+        unsubs.push(engine.on('ready', () => {
+          console.log('Wake word engine is ready and listening')
+        }))
+        console.log('Starting wake word engine...')
+        await engine.start()
+        console.log('Wake word engine started')
         setSupported(true)
-        detector.startListening()
-      } catch {
-        if (cancelled) return
+      } catch (error) {
+        console.error('Failed to load wake word engine:', error)
         setSupported(false)
       }
     }
@@ -130,21 +144,17 @@ export function WakewordFrame() {
     void start()
 
     return () => {
-      cancelled = true
-      try {
-        detector?.stopListening()
-      } catch {
-        // ignore
-      }
+      unsubs.forEach(unsub => unsub())
+      engine.stop()
     }
-  }, [activate])
+  }, [engine, activate])
 
   const v = Math.max(0, Math.min(1, activity))
-  const borderPadPx = Math.round(10 + v * 26)
-  const borderBlurPx = Math.round(10 + v * 20)
-  const blobBlurPx = Math.round(28 + v * 36)
-  const blobOpacity = (0.5 + v * 0.45).toFixed(3)
-  const blobScale = (1 + v * 0.12).toFixed(3)
+  const borderPadPx = Math.round(8 + v * 12)
+  const borderBlurPx = Math.round(8 + v * 8)
+  const blobBlurPx = Math.round(24 + v * 20)
+  const blobOpacity = (0.4 + v * 0.3).toFixed(3)
+  const blobScale = (1 + v * 0.08).toFixed(3)
 
   React.useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -184,14 +194,19 @@ export function WakewordFrame() {
       <main className="min-h-dvh bg-background text-foreground">
         <div className="mx-auto flex min-h-dvh max-w-3xl items-center justify-center px-6">
           <div className="w-full">
-            <SiriGlowClock />
+            <SiriGlowClock active={active} />
             {!supported ? (
               <div className="mt-4 text-center text-sm text-foreground/55">
-                Wakeword not ready. (Missing models or unsupported browser.)
+                Wake word engine not ready. (Missing models or unsupported browser.)
               </div>
             ) : null}
+            {detected && (
+              <div className="mt-4 text-center text-sm text-green-600">
+                Detected: {detected}
+              </div>
+            )}
             <div className="mt-2 text-center text-xs text-foreground/45">
-              Shortcut: Ctrl+B (may be reserved by your browser), fallback Ctrl+Shift+B.
+              Say "Alexa" to activate • Shortcut: Ctrl+B
             </div>
             {active ? (
               <div className="mt-2 text-center text-xs text-foreground/45">

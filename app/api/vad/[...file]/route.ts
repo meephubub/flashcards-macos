@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 
 const DIST_DIR = path.join(process.cwd(), "node_modules", "@ricky0123", "vad-web", "dist")
+const ONNX_RUNTIME_DIR = path.join(process.cwd(), "node_modules", "onnxruntime-web", "dist")
 
 function contentTypeFor(file: string) {
   if (file.endsWith(".wasm")) return "application/wasm"
@@ -22,18 +23,35 @@ export async function GET(
 
   if (rel.includes("..")) return new Response("Invalid path", { status: 400 })
 
-  const abs = path.join(DIST_DIR, rel)
-
+  // Check VAD directory first, then ONNX runtime directory
+  let abs = path.join(DIST_DIR, rel)
+  
   try {
-    const buf = await readFile(abs)
+    let buf = await readFile(abs)
     return new Response(buf, {
       headers: {
         "content-type": contentTypeFor(rel),
         "cache-control": "public, max-age=31536000, immutable",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Opener-Policy": "same-origin",
       },
     })
   } catch {
-    return new Response("Not found", { status: 404 })
+    // Try ONNX runtime directory
+    abs = path.join(ONNX_RUNTIME_DIR, rel)
+    try {
+      const buf = await readFile(abs)
+      return new Response(buf, {
+        headers: {
+          "content-type": contentTypeFor(rel),
+          "cache-control": "public, max-age=31536000, immutable",
+          "Cross-Origin-Embedder-Policy": "require-corp",
+          "Cross-Origin-Opener-Policy": "same-origin",
+        },
+      })
+    } catch {
+      return new Response("Not found", { status: 404 })
+    }
   }
 }
 
