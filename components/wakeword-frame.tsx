@@ -13,16 +13,62 @@ export function WakewordFrame() {
   const [micStatus, setMicStatus] = React.useState<"idle" | "requesting" | "active" | "denied">(
     "idle",
   )
-  const [detected, setDetected] = React.useState<string | null>(null)
 
   const vadRef = React.useRef<any | null>(null)
   const stopTimerRef = React.useRef<number | null>(null)
+  const activatedByWakewordRef = React.useRef(false)
   const engine = React.useMemo(() => new WakeWordEngine({
     baseAssetUrl: '/openwakeword/models',
     keywords: ['alexa'],
     detectionThreshold: 0.5,
     cooldownMs: 2000
   }), [])
+
+  const downloadWav = React.useCallback((audio: Float32Array, sampleRate: number) => {
+    const numChannels = 1
+    const bytesPerSample = 2
+    const blockAlign = numChannels * bytesPerSample
+    const byteRate = sampleRate * blockAlign
+    const dataSize = audio.length * bytesPerSample
+
+    const buffer = new ArrayBuffer(44 + dataSize)
+    const view = new DataView(buffer)
+
+    const writeString = (offset: number, str: string) => {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i))
+    }
+
+    writeString(0, "RIFF")
+    view.setUint32(4, 36 + dataSize, true)
+    writeString(8, "WAVE")
+    writeString(12, "fmt ")
+    view.setUint32(16, 16, true)
+    view.setUint16(20, 1, true)
+    view.setUint16(22, numChannels, true)
+    view.setUint32(24, sampleRate, true)
+    view.setUint32(28, byteRate, true)
+    view.setUint16(32, blockAlign, true)
+    view.setUint16(34, 16, true)
+    writeString(36, "data")
+    view.setUint32(40, dataSize, true)
+
+    let offset = 44
+    for (let i = 0; i < audio.length; i++) {
+      const s = Math.max(-1, Math.min(1, audio[i]))
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
+      offset += 2
+    }
+
+    const blob = new Blob([buffer], { type: "audio/wav" })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `vad-${new Date().toISOString().replace(/[:.]/g, "-")}.wav`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }, [])
 
   const clearStopTimer = React.useCallback(() => {
     if (stopTimerRef.current) {
@@ -36,6 +82,7 @@ export function WakewordFrame() {
     setActive(false)
     setActivity(0)
     setMicStatus("idle")
+    activatedByWakewordRef.current = false
     if (vadRef.current) {
       try {
         await vadRef.current.destroy()
@@ -80,7 +127,14 @@ export function WakewordFrame() {
         onSpeechStart: () => {
           clearStopTimer()
         },
-        onSpeechEnd: () => {
+        onSpeechEnd: (audio) => {
+          if (activatedByWakewordRef.current) {
+            try {
+              downloadWav(audio, 16000)
+            } catch (e) {
+              console.error("Failed to download VAD audio:", e)
+            }
+          }
           void deactivate()
         },
         onVADMisfire: () => {
@@ -278,7 +332,7 @@ registerProcessor('audio-processor', AudioProcessor);
         console.log('Wake word engine loaded successfully')
         unsubs.push(engine.on('detect', ({ keyword, score }: { keyword: string; score: number }) => {
           console.log(`Wake word detected: ${keyword} (${score})`)
-          setDetected(`${keyword} (${score.toFixed(2)})`)
+          activatedByWakewordRef.current = true
           void activate()
         }))
         unsubs.push(engine.on('error', (err: any) => {
@@ -349,6 +403,7 @@ registerProcessor('audio-processor', AudioProcessor);
       if (!isCtrlB && !isCtrlShiftB) return
       e.preventDefault()
       e.stopPropagation()
+      activatedByWakewordRef.current = false
       void activate()
     }
 
@@ -380,11 +435,6 @@ registerProcessor('audio-processor', AudioProcessor);
                 Wake word engine not ready. (Missing models or unsupported browser.)
               </div>
             ) : null}
-            {detected && (
-              <div className="mt-4 text-center text-sm text-green-600">
-                Detected: {detected}
-              </div>
-            )}
             <div className="mt-2 text-center text-xs text-foreground/45">
               Say "Alexa" to activate • Shortcut: Ctrl+B
             </div>
