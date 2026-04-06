@@ -127,3 +127,150 @@
     @apply font-sans;
     }
 }
+
+@keyframes siriGradientShift {
+  0% {
+    background-position: 0% 50%;
+    filter: hue-rotate(0deg);
+  }
+  50% {
+    background-position: 100% 50%;
+    filter: hue-rotate(180deg);
+  }
+  100% {
+    background-position: 0% 50%;
+    filter: hue-rotate(360deg);
+  }
+}
+
+@keyframes siriBorderSpin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes siriBlobDrift {
+  0% {
+    transform: translate(-10%, -8%) scale(var(--siri-blob-scale, 1));
+  }
+  50% {
+    transform: translate(12%, 10%) scale(calc(var(--siri-blob-scale, 1) * 1.04));
+  }
+  100% {
+    transform: translate(-10%, -8%) scale(var(--siri-blob-scale, 1));
+  }
+}
+
+.siri-glow {
+  position: relative;
+  border-radius: 28px;
+  padding: 2px;
+  isolation: isolate;
+  background: linear-gradient(
+    115deg,
+    oklch(0.78 0.25 20),
+    oklch(0.74 0.26 264),
+    oklch(0.74 0.24 305),
+    oklch(0.8 0.22 145),
+    oklch(0.78 0.25 20)
+  );
+  background-size: 300% 300%;
+  animation: siriGradientShift 7s ease-in-out infinite;
+}
+
+.siri-glow::before {
+  content: "";
+  position: absolute;
+  inset: -16px;
+  border-radius: inherit;
+  background: inherit;
+  background-size: 400% 400%;
+  filter: blur(26px);
+  opacity: 0.85;
+  z-index: 0;
+  animation: siriGradientShift 9s ease-in-out infinite;
+}
+
+.siri-glow::after {
+  content: "";
+  position: absolute;
+  inset: -30px;
+  border-radius: 9999px;
+  background:
+    radial-gradient(circle at 30% 40%, oklch(0.78 0.25 20 / 0.9), transparent 55%),
+    radial-gradient(circle at 70% 35%, oklch(0.74 0.26 264 / 0.9), transparent 60%),
+    radial-gradient(circle at 55% 75%, oklch(0.8 0.22 145 / 0.9), transparent 60%),
+    radial-gradient(circle at 35% 80%, oklch(0.74 0.24 305 / 0.9), transparent 60%);
+  filter: blur(30px);
+  opacity: 0.55;
+  mix-blend-mode: screen;
+  z-index: 0;
+  animation: siriBlobDrift 6.5s ease-in-out infinite;
+}
+
+.siri-glow-inner {
+  position: relative;
+  z-index: 1;
+  border-radius: 26px;
+  overflow: hidden;
+}
+
+.siri-screen-border {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 180ms ease;
+  border-radius: 0;
+}
+
+.siri-screen-border.is-active {
+  opacity: 1;
+}
+
+.siri-screen-border::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  padding: var(--siri-border-pad, 14px);
+  border-radius: 0px;
+  background:
+    conic-gradient(
+      from 0deg,
+      oklch(0.78 0.25 20),
+      oklch(0.74 0.26 264),
+      oklch(0.74 0.24 305),
+      oklch(0.8 0.22 145),
+      oklch(0.78 0.25 20)
+    ),
+    radial-gradient(circle at 20% 20%, oklch(0.95 0.05 280 / 0.7), transparent 35%),
+    radial-gradient(circle at 80% 35%, oklch(0.95 0.05 30 / 0.6), transparent 40%),
+    radial-gradient(circle at 55% 85%, oklch(0.95 0.05 160 / 0.6), transparent 40%);
+  filter: blur(var(--siri-border-blur, 10px)) saturate(1.22);
+  animation:
+    siriBorderSpin 7.5s linear infinite,
+    siriGradientShift 5.5s ease-in-out infinite;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+
+.siri-screen-border::after {
+  content: "";
+  position: absolute;
+  inset: -34px;
+  border-radius: 0;
+  background:
+    radial-gradient(circle at 18% 30%, oklch(0.78 0.25 20 / 0.95), transparent 58%),
+    radial-gradient(circle at 80% 28%, oklch(0.74 0.26 264 / 0.95), transparent 60%),
+    radial-gradient(circle at 60% 78%, oklch(0.8 0.22 145 / 0.95), transparent 60%),
+    radial-gradient(circle at 30% 82%, oklch(0.74 0.24 305 / 0.95), transparent 62%);
+  transform: scale(var(--siri-blob-scale, 1));
+  filter: blur(var(--siri-blob-blur, 32px));
+  opacity: var(--siri-blob-opacity, 0.7);
+  mix-blend-mode: screen;
+  animation: siriBlobDrift 5.2s ease-in-out infinite;
+}
