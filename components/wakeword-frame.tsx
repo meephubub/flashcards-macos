@@ -119,6 +119,162 @@ export function WakewordFrame() {
       try {
         console.log('Loading wake word engine...')
         await engine.load()
+        try {
+          const ort = await import("onnxruntime-web")
+          const anyEngine = engine as any
+          const vadModel = anyEngine?._vadModel
+          if (vadModel?.inputNames?.includes("state")) {
+            const stateName = "state"
+            const meta = vadModel.inputMetadata?.[stateName]
+            const shape = Array.isArray(meta?.shape) ? meta.shape : [2, 1, 128]
+            const size = shape.reduce((acc: number, d: unknown) => {
+              return acc * (typeof d === "number" && Number.isFinite(d) ? d : 1)
+            }, 1)
+
+            anyEngine._vadState = anyEngine._vadState ?? {}
+            anyEngine._vadState.state = new ort.Tensor(
+              "float32",
+              new Float32Array(size).fill(0),
+              shape,
+            )
+
+            anyEngine._runVad = async (chunk: Float32Array) => {
+              try {
+                const tensor = new ort.Tensor("float32", chunk, [1, chunk.length])
+                const sr = new ort.Tensor("int64", [BigInt(anyEngine.config.sampleRate)], [])
+                const res = await vadModel.run({ input: tensor, sr, state: anyEngine._vadState.state })
+
+                if (res?.state) {
+                  anyEngine._vadState.state = res.state
+                }
+
+                const outputName = vadModel.outputNames?.find((n: string) => n !== "state") ?? "output"
+                const confidence = res?.[outputName]?.data?.[0] ?? res?.output?.data?.[0]
+                return typeof confidence === "number" ? confidence > 0.5 : false
+              } catch (err) {
+                anyEngine._emitter?.emit?.("error", err)
+                return false
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("Wake word VAD patch skipped:", e)
+        }
+
+        try {
+          const anyEngine = engine as any
+          const origStart = anyEngine.start?.bind(anyEngine)
+          if (typeof origStart === "function") {
+            anyEngine.start = async (
+              opts: { deviceId?: string; gain?: number } = {},
+            ) => {
+              const { deviceId, gain = 1.0 } = opts
+              if (!anyEngine._loaded) throw new Error("Call load() before start()")
+              if (anyEngine._workletNode) return
+
+              anyEngine._resetState?.()
+              anyEngine._mediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+              })
+
+              anyEngine._audioContext = new AudioContext({ sampleRate: anyEngine.config.sampleRate })
+              try {
+                await anyEngine._audioContext.resume()
+              } catch {}
+              if (!anyEngine._audioContext.audioWorklet) {
+                throw new Error("AudioWorklet is not supported in this browser")
+              }
+              const source = anyEngine._audioContext.createMediaStreamSource(anyEngine._mediaStream)
+              anyEngine._gainNode = anyEngine._audioContext.createGain()
+              anyEngine._gainNode.gain.value = gain
+
+              const AUDIO_PROCESSOR_COMPAT = `
+class AudioProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.bufferSize = 1280;
+    this._buffer = new Float32Array(this.bufferSize);
+    this._pos = 0;
+  }
+  process(inputs) {
+    const input = inputs[0] && inputs[0][0];
+    if (input) {
+      for (let i = 0; i < input.length; i++) {
+        this._buffer[this._pos++] = input[i];
+        if (this._pos === this.bufferSize) {
+          this.port.postMessage(this._buffer);
+          this._pos = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('audio-processor', AudioProcessor);
+`
+
+              const blob = new Blob([AUDIO_PROCESSOR_COMPAT], { type: "application/javascript" })
+              const workletURL = URL.createObjectURL(blob)
+              try {
+                try {
+                  await anyEngine._audioContext.audioWorklet.addModule(workletURL)
+                } catch (err) {
+                  console.error("AudioWorklet addModule failed:", err)
+                  throw err
+                }
+              } finally {
+                URL.revokeObjectURL(workletURL)
+              }
+
+              let sinkNode: AudioNode
+              try {
+                anyEngine._workletNode = new AudioWorkletNode(anyEngine._audioContext, "audio-processor")
+                anyEngine._workletNode.port.onmessage = (event: MessageEvent) => {
+                  const chunk = (event as any).data
+                  if (!chunk) return
+                  anyEngine._processingQueue = anyEngine._processingQueue
+                    .then(() => anyEngine._processChunk(chunk))
+                    .catch((err: unknown) => {
+                      anyEngine._emitter.emit("error", err)
+                    })
+                }
+                sinkNode = anyEngine._workletNode
+              } catch (err) {
+                console.error("AudioWorkletNode creation failed:", err)
+
+                const processor = anyEngine._audioContext.createScriptProcessor(0, 1, 1)
+                let buf = new Float32Array(1280)
+                let pos = 0
+                processor.onaudioprocess = (ev: AudioProcessingEvent) => {
+                  const input = ev.inputBuffer.getChannelData(0)
+                  for (let i = 0; i < input.length; i++) {
+                    buf[pos++] = input[i]
+                    if (pos === buf.length) {
+                      const chunk = buf
+                      buf = new Float32Array(1280)
+                      pos = 0
+                      anyEngine._processingQueue = anyEngine._processingQueue
+                        .then(() => anyEngine._processChunk(chunk))
+                        .catch((e: unknown) => {
+                          anyEngine._emitter.emit("error", e)
+                        })
+                    }
+                  }
+                }
+
+                anyEngine._workletNode = processor
+                sinkNode = processor
+              }
+
+              source.connect(anyEngine._gainNode)
+              anyEngine._gainNode.connect(sinkNode)
+              sinkNode.connect(anyEngine._audioContext.destination)
+            }
+          }
+        } catch (e) {
+          console.warn("Wake word worklet patch skipped:", e)
+        }
+
         console.log('Wake word engine loaded successfully')
         unsubs.push(engine.on('detect', ({ keyword, score }: { keyword: string; score: number }) => {
           console.log(`Wake word detected: ${keyword} (${score})`)
@@ -131,9 +287,33 @@ export function WakewordFrame() {
         unsubs.push(engine.on('ready', () => {
           console.log('Wake word engine is ready and listening')
         }))
-        console.log('Starting wake word engine...')
-        await engine.start()
-        console.log('Wake word engine started')
+
+        const startEngine = async () => {
+          try {
+            console.log('Starting wake word engine...')
+            await engine.start()
+            console.log('Wake word engine started')
+          } catch (err) {
+            console.error('Wake word engine start failed:', err)
+            throw err
+          }
+        }
+
+        const onFirstGesture = () => {
+          window.removeEventListener('pointerdown', onFirstGesture)
+          window.removeEventListener('keydown', onFirstGesture)
+          void startEngine()
+        }
+
+        window.addEventListener('pointerdown', onFirstGesture)
+        window.addEventListener('keydown', onFirstGesture)
+
+        try {
+          await startEngine()
+          window.removeEventListener('pointerdown', onFirstGesture)
+          window.removeEventListener('keydown', onFirstGesture)
+        } catch {
+        }
         setSupported(true)
       } catch (error) {
         console.error('Failed to load wake word engine:', error)
