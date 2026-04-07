@@ -3,6 +3,7 @@
 import * as React from "react"
 
 import { SiriGlowClock } from "./siri-glow-clock"
+import { Markdown } from "./ui/markdown"
 // @ts-ignore - No types available for this package
 import WakeWordEngine from "openwakeword-wasm-browser"
 
@@ -14,9 +15,20 @@ export function WakewordFrame() {
     "idle",
   )
 
+  const [systemPrompt, setSystemPrompt] = React.useState<string>("")
+  const [streamResponse, setStreamResponse] = React.useState<string>("")
+  const [isStreaming, setIsStreaming] = React.useState(false)
+  const [streamError, setStreamError] = React.useState<string | null>(null)
+  const [ttsEnabled, setTtsEnabled] = React.useState(false)
+
   const vadRef = React.useRef<any | null>(null)
   const stopTimerRef = React.useRef<number | null>(null)
-  const activatedByWakewordRef = React.useRef(false)
+  const shouldSendToAgentRef = React.useRef(false)
+  const abortControllerRef = React.useRef<AbortController | null>(null)
+  const ttsRef = React.useRef<any | null>(null)
+  const ttsQueueRef = React.useRef<string[]>([])
+  const ttsPlayingRef = React.useRef(false)
+  const ttsSplitterRef = React.useRef<any | null>(null)
   const engine = React.useMemo(() => new WakeWordEngine({
     baseAssetUrl: '/openwakeword/models',
     keywords: ['alexa'],
@@ -24,51 +36,151 @@ export function WakewordFrame() {
     cooldownMs: 2000
   }), [])
 
-  const downloadWav = React.useCallback((audio: Float32Array, sampleRate: number) => {
-    const numChannels = 1
-    const bytesPerSample = 2
-    const blockAlign = numChannels * bytesPerSample
-    const byteRate = sampleRate * blockAlign
-    const dataSize = audio.length * bytesPerSample
+  const sendAudioToAgent = React.useCallback(async (audio: Float32Array) => {
+    const wav = await (async () => {
+      const numChannels = 1
+      const bytesPerSample = 2
+      const blockAlign = numChannels * bytesPerSample
+      const byteRate = 16000 * blockAlign
+      const dataSize = audio.length * bytesPerSample
 
-    const buffer = new ArrayBuffer(44 + dataSize)
-    const view = new DataView(buffer)
+      const buffer = new ArrayBuffer(44 + dataSize)
+      const view = new DataView(buffer)
 
-    const writeString = (offset: number, str: string) => {
-      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i))
+      const writeString = (offset: number, str: string) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i))
+      }
+
+      writeString(0, "RIFF")
+      view.setUint32(4, 36 + dataSize, true)
+      writeString(8, "WAVE")
+      writeString(12, "fmt ")
+      view.setUint32(16, 16, true)
+      view.setUint16(20, 1, true)
+      view.setUint16(22, numChannels, true)
+      view.setUint32(24, 16000, true)
+      view.setUint32(28, byteRate, true)
+      view.setUint16(32, blockAlign, true)
+      view.setUint16(34, 16, true)
+      writeString(36, "data")
+      view.setUint32(40, dataSize, true)
+
+      let offset = 44
+      for (let i = 0; i < audio.length; i++) {
+        const s = Math.max(-1, Math.min(1, audio[i]))
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
+        offset += 2
+      }
+
+      return new Blob([buffer], { type: "audio/wav" })
+    })()
+
+    const formData = new FormData()
+    formData.append("files", wav, "recording.wav")
+    if (systemPrompt.trim()) {
+      formData.append("text", systemPrompt.trim())
     }
 
-    writeString(0, "RIFF")
-    view.setUint32(4, 36 + dataSize, true)
-    writeString(8, "WAVE")
-    writeString(12, "fmt ")
-    view.setUint32(16, 16, true)
-    view.setUint16(20, 1, true)
-    view.setUint16(22, numChannels, true)
-    view.setUint32(24, sampleRate, true)
-    view.setUint32(28, byteRate, true)
-    view.setUint16(32, blockAlign, true)
-    view.setUint16(34, 16, true)
-    writeString(36, "data")
-    view.setUint32(40, dataSize, true)
+    const controller = new AbortController()
+    abortControllerRef.current = controller
 
-    let offset = 44
-    for (let i = 0; i < audio.length; i++) {
-      const s = Math.max(-1, Math.min(1, audio[i]))
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
-      offset += 2
+    try {
+      setIsStreaming(true)
+      setStreamResponse("")
+
+      const res = await fetch("/api/proxy/chat/stream", {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      })
+
+      if (!res.ok) {
+        throw new Error(`Agent responded ${res.status}`)
+      }
+
+      const reader = res.body?.getReader()
+      const decoder = new TextDecoder()
+
+      if (!reader) {
+        throw new Error("No response body")
+      }
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const chunk = decoder.decode(value, { stream: true })
+        const lines = chunk.split("\n")
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const payload = line.slice(6)
+            if (payload === "[DONE]") {
+              return
+            }
+            setStreamResponse(payload)
+            if (ttsEnabled && ttsSplitterRef.current) {
+              const tokens = payload.match(/\s*\S+/g) || []
+              ttsQueueRef.current.push(...tokens)
+              processTTSQueue()
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Agent stream error:", e)
+      setStreamError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setIsStreaming(false)
+      abortControllerRef.current = null
     }
+  }, [systemPrompt])
 
-    const blob = new Blob([buffer], { type: "audio/wav" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = `vad-${new Date().toISOString().replace(/[:.]/g, "-")}.wav`
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
+  const initTTS = React.useCallback(async () => {
+    if (ttsRef.current) return
+    try {
+      const { KokoroTTS, TextSplitterStream } = await import("kokoro-js")
+      const model_id = "onnx-community/Kokoro-82M-v1.0-ONNX"
+      ttsRef.current = await KokoroTTS.from_pretrained(model_id, {
+        dtype: "fp32",
+      })
+      ttsSplitterRef.current = new TextSplitterStream()
+      const stream = ttsRef.current.stream(ttsSplitterRef.current)
+      ;(async () => {
+        for await (const { audio } of stream) {
+          const buf = await audio.arrayBuffer()
+          const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+          const audioBuffer = await audioCtx.decodeAudioData(buf)
+          const source = audioCtx.createBufferSource()
+          source.buffer = audioBuffer
+          source.connect(audioCtx.destination)
+          source.onended = () => {
+            ttsPlayingRef.current = false
+            processTTSQueue()
+          }
+          ttsPlayingRef.current = true
+          source.start(0)
+        }
+      })()
+    } catch (e) {
+      console.error("Failed to init TTS:", e)
+    }
   }, [])
+
+  const processTTSQueue = React.useCallback(() => {
+    if (!ttsEnabled || !ttsRef.current || !ttsSplitterRef.current || ttsPlayingRef.current || ttsQueueRef.current.length === 0) return
+    const next = ttsQueueRef.current.shift()
+    if (next) {
+      ttsSplitterRef.current.push(next)
+      ttsSplitterRef.current.flush()
+    }
+  }, [ttsEnabled])
+
+  React.useEffect(() => {
+    if (ttsEnabled) {
+      void initTTS()
+    }
+  }, [ttsEnabled, initTTS])
 
   const clearStopTimer = React.useCallback(() => {
     if (stopTimerRef.current) {
@@ -82,7 +194,11 @@ export function WakewordFrame() {
     setActive(false)
     setActivity(0)
     setMicStatus("idle")
-    activatedByWakewordRef.current = false
+    shouldSendToAgentRef.current = false
+    abortControllerRef.current?.abort()
+    abortControllerRef.current = null
+    setIsStreaming(false)
+    setStreamError(null)
     if (vadRef.current) {
       try {
         await vadRef.current.destroy()
@@ -127,20 +243,16 @@ export function WakewordFrame() {
         onSpeechStart: () => {
           clearStopTimer()
         },
-        onSpeechEnd: (audio) => {
-          if (activatedByWakewordRef.current) {
-            try {
-              downloadWav(audio, 16000)
-            } catch (e) {
-              console.error("Failed to download VAD audio:", e)
-            }
+        onSpeechEnd: (audio: Float32Array) => {
+          if (shouldSendToAgentRef.current) {
+            void sendAudioToAgent(audio)
           }
           void deactivate()
         },
         onVADMisfire: () => {
           void deactivate()
         },
-        onFrameProcessed: (_probs, frame) => {
+        onFrameProcessed: (_probs: any, frame: any) => {
           let sum = 0
           for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i]
           const rms = Math.sqrt(sum / frame.length)
@@ -158,7 +270,7 @@ export function WakewordFrame() {
       console.error("VAD initialization failed:", error)
       setMicStatus("denied")
     }
-  }, [clearStopTimer, deactivate])
+  }, [clearStopTimer, deactivate, sendAudioToAgent])
 
   React.useEffect(() => {
     return () => {
@@ -231,108 +343,93 @@ export function WakewordFrame() {
                 audio: deviceId ? { deviceId: { exact: deviceId } } : true,
               })
 
-              anyEngine._audioContext = new AudioContext({ sampleRate: anyEngine.config.sampleRate })
+              const ctx = new AudioContext({ sampleRate: anyEngine.config.sampleRate })
+              anyEngine._audioContext = ctx
               try {
-                await anyEngine._audioContext.resume()
+                await ctx.resume()
               } catch {}
-              if (!anyEngine._audioContext.audioWorklet) {
-                throw new Error("AudioWorklet is not supported in this browser")
-              }
-              const source = anyEngine._audioContext.createMediaStreamSource(anyEngine._mediaStream)
-              anyEngine._gainNode = anyEngine._audioContext.createGain()
-              anyEngine._gainNode.gain.value = gain
 
-              const AUDIO_PROCESSOR_COMPAT = `
-class AudioProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.bufferSize = 1280;
-    this._buffer = new Float32Array(this.bufferSize);
-    this._pos = 0;
-  }
-  process(inputs) {
-    const input = inputs[0] && inputs[0][0];
-    if (input) {
-      for (let i = 0; i < input.length; i++) {
-        this._buffer[this._pos++] = input[i];
-        if (this._pos === this.bufferSize) {
-          this.port.postMessage(this._buffer);
-          this._pos = 0;
-        }
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('audio-processor', AudioProcessor);
-`
+              const source = ctx.createMediaStreamSource(anyEngine._mediaStream)
+              const gainNode = ctx.createGain()
+              gainNode.gain.value = gain
+              anyEngine._gainNode = gainNode
 
-              const blob = new Blob([AUDIO_PROCESSOR_COMPAT], { type: "application/javascript" })
-              const workletURL = URL.createObjectURL(blob)
-              try {
-                try {
-                  await anyEngine._audioContext.audioWorklet.addModule(workletURL)
-                } catch (err) {
-                  console.error("AudioWorklet addModule failed:", err)
-                  throw err
-                }
-              } finally {
-                URL.revokeObjectURL(workletURL)
-              }
+              const processor = ctx.createScriptProcessor(0, 1, 1)
+              let buf = new Float32Array(1280)
+              let pos = 0
 
-              let sinkNode: AudioNode
-              try {
-                anyEngine._workletNode = new AudioWorkletNode(anyEngine._audioContext, "audio-processor")
-                anyEngine._workletNode.port.onmessage = (event: MessageEvent) => {
-                  const chunk = (event as any).data
-                  if (!chunk) return
-                  anyEngine._processingQueue = anyEngine._processingQueue
-                    .then(() => anyEngine._processChunk(chunk))
-                    .catch((err: unknown) => {
-                      anyEngine._emitter.emit("error", err)
-                    })
-                }
-                sinkNode = anyEngine._workletNode
-              } catch (err) {
-                console.error("AudioWorkletNode creation failed:", err)
-
-                const processor = anyEngine._audioContext.createScriptProcessor(0, 1, 1)
-                let buf = new Float32Array(1280)
-                let pos = 0
-                processor.onaudioprocess = (ev: AudioProcessingEvent) => {
-                  const input = ev.inputBuffer.getChannelData(0)
-                  for (let i = 0; i < input.length; i++) {
-                    buf[pos++] = input[i]
-                    if (pos === buf.length) {
-                      const chunk = buf
-                      buf = new Float32Array(1280)
-                      pos = 0
-                      anyEngine._processingQueue = anyEngine._processingQueue
-                        .then(() => anyEngine._processChunk(chunk))
-                        .catch((e: unknown) => {
-                          anyEngine._emitter.emit("error", e)
-                        })
-                    }
+              processor.onaudioprocess = (ev: AudioProcessingEvent) => {
+                const input = ev.inputBuffer.getChannelData(0)
+                for (let i = 0; i < input.length; i++) {
+                  buf[pos++] = input[i]
+                  if (pos === buf.length) {
+                    const chunk = buf
+                    buf = new Float32Array(1280)
+                    pos = 0
+                    anyEngine._processingQueue = anyEngine._processingQueue
+                      .then(() => anyEngine._processChunk(chunk))
+                      .catch((e: unknown) => {
+                        anyEngine._emitter.emit("error", e)
+                      })
                   }
                 }
-
-                anyEngine._workletNode = processor
-                sinkNode = processor
               }
 
-              source.connect(anyEngine._gainNode)
-              anyEngine._gainNode.connect(sinkNode)
-              sinkNode.connect(anyEngine._audioContext.destination)
+              anyEngine._workletNode = processor
+
+              source.connect(gainNode)
+              gainNode.connect(processor)
+              processor.connect(ctx.destination)
             }
           }
         } catch (e) {
           console.warn("Wake word worklet patch skipped:", e)
         }
 
+        try {
+          const anyEngine = engine as any
+          const origStop = anyEngine.stop?.bind(anyEngine)
+          if (typeof origStop === "function") {
+            anyEngine.stop = async () => {
+              const node = anyEngine._workletNode
+              if (node) {
+                try {
+                  if (node.port) node.port.onmessage = null
+                } catch {}
+                try {
+                  node.disconnect()
+                } catch {}
+                anyEngine._workletNode = null
+              }
+              if (anyEngine._gainNode) {
+                try {
+                  anyEngine._gainNode.disconnect()
+                } catch {}
+                anyEngine._gainNode = null
+              }
+              if (anyEngine._audioContext && anyEngine._audioContext.state !== "closed") {
+                try {
+                  await anyEngine._audioContext.close()
+                } catch {}
+              }
+              anyEngine._audioContext = null
+              if (anyEngine._mediaStream) {
+                try {
+                  anyEngine._mediaStream.getTracks().forEach((track: MediaStreamTrack) => track.stop())
+                } catch {}
+                anyEngine._mediaStream = null
+              }
+              anyEngine._isDetectionCoolingDown = false
+            }
+          }
+        } catch (e) {
+          console.warn("Wake word stop patch skipped:", e)
+        }
+
         console.log('Wake word engine loaded successfully')
         unsubs.push(engine.on('detect', ({ keyword, score }: { keyword: string; score: number }) => {
           console.log(`Wake word detected: ${keyword} (${score})`)
-          activatedByWakewordRef.current = true
+          shouldSendToAgentRef.current = true
           void activate()
         }))
         unsubs.push(engine.on('error', (err: any) => {
@@ -366,8 +463,7 @@ registerProcessor('audio-processor', AudioProcessor);
           await startEngine()
           window.removeEventListener('pointerdown', onFirstGesture)
           window.removeEventListener('keydown', onFirstGesture)
-        } catch {
-        }
+        } catch {}
         setSupported(true)
       } catch (error) {
         console.error('Failed to load wake word engine:', error)
@@ -399,12 +495,28 @@ registerProcessor('audio-processor', AudioProcessor);
       // but also support Ctrl+Shift+B as a reliable fallback.
       const isCtrlB = ctrlOrMeta && key === "b"
       const isCtrlShiftB = ctrlOrMeta && e.shiftKey && key === "b"
+      const isCtrlO = ctrlOrMeta && key === "o"
+
+      if (isCtrlO) {
+        e.preventDefault()
+        e.stopPropagation()
+        setTtsEnabled((v) => !v)
+        return
+      }
 
       if (!isCtrlB && !isCtrlShiftB) return
       e.preventDefault()
       e.stopPropagation()
-      activatedByWakewordRef.current = false
+      shouldSendToAgentRef.current = true
       void activate()
+      // Immediately start VAD for manual activation
+      if (vadRef.current) {
+        try {
+          void vadRef.current.start()
+        } catch {
+          // ignore
+        }
+      }
     }
 
     document.addEventListener("keydown", onKeyDown, { capture: true })
@@ -435,8 +547,49 @@ registerProcessor('audio-processor', AudioProcessor);
                 Wake word engine not ready. (Missing models or unsupported browser.)
               </div>
             ) : null}
+            <div className="mt-4 max-w-2xl mx-auto">
+              <label className="block text-xs font-medium text-muted-foreground mb-1">
+                System prompt (optional)
+              </label>
+              <textarea
+                value={systemPrompt}
+                onChange={(e) => setSystemPrompt(e.target.value)}
+                placeholder="You are a helpful assistant."
+                className="w-full resize-none rounded-md border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                rows={2}
+              />
+            </div>
+            {streamResponse && (
+              <div className="mt-4 max-w-2xl mx-auto">
+                <div className="rounded-lg border bg-muted p-4">
+                  <div className="mb-2 text-xs font-medium text-muted-foreground">
+                    {isStreaming ? "Agent is responding..." : streamError ? "Error" : "Agent response"}
+                  </div>
+                  <Markdown className="text-sm leading-relaxed">
+                    {streamResponse}
+                  </Markdown>
+                  {streamError && (
+                    <button
+                      type="button"
+                      className="mt-2 text-xs text-blue-600 underline hover:text-blue-800"
+                      onClick={() => {
+                        setStreamError(null)
+                        setStreamResponse("")
+                      }}
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            {isStreaming && (
+              <div className="mt-2 text-center text-xs text-muted-foreground animate-pulse">
+                Waiting for agent stream...
+              </div>
+            )}
             <div className="mt-2 text-center text-xs text-foreground/45">
-              Say "Alexa" to activate • Shortcut: Ctrl+B
+              Say "Alexa" to activate &bull; Shortcut: Ctrl+B &bull; {ttsEnabled ? "TTS ON" : "TTS OFF"} (Ctrl+O)
             </div>
             {active ? (
               <div className="mt-2 text-center text-xs text-foreground/45">
@@ -449,4 +602,3 @@ registerProcessor('audio-processor', AudioProcessor);
     </>
   )
 }
-
